@@ -76,3 +76,28 @@ export interface ClientHistoryResult {
   histories: ClientHistory[];
   historyByProjectId: Map<string, ClientHistory>;
 }
+
+export interface ProjectState {
+  projectId: string;
+  month: Month;
+  projectName: string;
+  serviceType: string;
+  termMonths: number;
+  projectType: string;
+}
+
+export type ProjectStateIssueType = "DATA_CONFLICT" | "NEEDS_REVIEW";
+
+export interface ProjectStateIssue {
+  type: ProjectStateIssueType;
+  projectId: string;
+  month: Month;
+  field: "project_name" | "service_type" | "term_months";
+  message: string;
+}
+
+export interface ProjectStateResult {
+  states: ProjectState[];
+  stateByProjectAndMonth: Map<string, ProjectState>;
+  issues: ProjectStateIssue[];
+}

@@ -8,6 +8,7 @@ import {
   describeIndexes,
 } from "./indexes.js";
 import { DataValidationError, describeInputData, loadInputData } from "./loaders.js";
+import { buildProjectStates, ProjectStateResolutionError } from "./temporal-state.js";
 
 function getDataDirectory(args: string[]): string {
   const dataDirectoryFlagIndex = args.indexOf("--data-dir");
@@ -28,6 +29,7 @@ async function main(): Promise<void> {
   const data = await loadInputData(dataDirectory);
   const indexes = buildInputIndexes(data);
   const clientHistories = buildClientHistories(indexes);
+  const projectStates = buildProjectStates(data, indexes);
 
   console.log(`Данные загружены из: ${dataDirectory}`);
   console.log("\nЗагруженные таблицы:");
@@ -44,13 +46,18 @@ async function main(): Promise<void> {
   for (const history of clientHistories.histories) {
     console.log(`- ${history.projectIds.join(" → ")} → client_id ${history.clientId}`);
   }
+
+  console.log("\nВременные состояния проектов:");
+  console.log(`- восстановлено состояний: ${projectStates.states.length}`);
+  console.log(`- конфликтов справочных сроков: ${projectStates.issues.length}`);
 }
 
 main().catch((error: unknown) => {
   if (
     error instanceof CsvParseError ||
     error instanceof DataValidationError ||
-    error instanceof DataInvariantError
+    error instanceof DataInvariantError ||
+    error instanceof ProjectStateResolutionError
   ) {
     const location = "source" in error && "row" in error && error.row
       ? ` (${error.source}, строка ${error.row})`
