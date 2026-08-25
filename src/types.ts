@@ -186,3 +186,43 @@ export interface StatusResolutionResult {
   flights: ResolvedFlight[];
   issues: StatusIssue[];
 }
+
+export type AuditFlag = "REPORT_ERROR" | "DATA_CONFLICT" | "NEEDS_REVIEW";
+
+export interface ExpectedReportRecord {
+  clientId: string;
+  projectIds: string;
+  projectName: string;
+  serviceType: string;
+  termMonths: number;
+  flightNo: number;
+  flightStart: Month;
+  flightEnd: Month;
+  lastActiveMonth: Month | null;
+  status: FlightStatus;
+  reportGeneratedAt: Month;
+}
+
+export interface ReportDiscrepancy {
+  issueId: string;
+  type: AuditFlag;
+  clientId: string;
+  flightNo: number;
+  flightStart: Month;
+  field: string;
+  expectedValue: string | null;
+  actualValue: string | null;
+  evidence: string;
+  comment: string;
+}
+
+export interface FixedReportRecord extends ExpectedReportRecord {
+  auditFlags: string;
+  auditComment: string;
+}
+
+export interface ReportComparisonResult {
+  expectedRecords: ExpectedReportRecord[];
+  fixedRecords: FixedReportRecord[];
+  discrepancies: ReportDiscrepancy[];
+}

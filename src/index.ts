@@ -9,6 +9,12 @@ import {
   describeIndexes,
 } from "./indexes.js";
 import { DataValidationError, describeInputData, loadInputData } from "./loaders.js";
+import {
+  compareReport,
+  describeReportComparison,
+  ReportComparisonError,
+  writeReportArtifacts,
+} from "./report-comparison.js";
 import { describeStatusResolution, resolveFlightStatuses, StatusResolutionError } from "./statuses.js";
 import { buildProjectStates, ProjectStateResolutionError } from "./temporal-state.js";
 
@@ -34,6 +40,8 @@ async function main(): Promise<void> {
   const projectStates = buildProjectStates(data, indexes);
   const flightBuild = buildFlights(data, indexes, clientHistories, projectStates);
   const statusResolution = resolveFlightStatuses(data, clientHistories, flightBuild);
+  const comparison = compareReport(data, statusResolution, projectStates);
+  const reportArtifacts = await writeReportArtifacts(comparison, process.cwd());
 
   console.log(`Данные загружены из: ${dataDirectory}`);
   console.log("\nЗагруженные таблицы:");
@@ -64,6 +72,13 @@ async function main(): Promise<void> {
   for (const description of describeStatusResolution(statusResolution)) {
     console.log(`- ${description}`);
   }
+
+  console.log("\nСравнение с исходным report.csv:");
+  for (const description of describeReportComparison(comparison)) {
+    console.log(`- ${description}`);
+  }
+  console.log(`- исправленный отчёт: ${reportArtifacts.reportFixedPath}`);
+  console.log(`- детализированные расхождения: ${reportArtifacts.discrepanciesPath}`);
 }
 
 main().catch((error: unknown) => {
@@ -73,7 +88,8 @@ main().catch((error: unknown) => {
     error instanceof DataInvariantError ||
     error instanceof ProjectStateResolutionError ||
     error instanceof FlightBuildError ||
-    error instanceof StatusResolutionError
+    error instanceof StatusResolutionError ||
+    error instanceof ReportComparisonError
   ) {
     const location = "source" in error && "row" in error && error.row
       ? ` (${error.source}, строка ${error.row})`
