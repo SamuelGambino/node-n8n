@@ -101,3 +101,53 @@ export interface ProjectStateResult {
   stateByProjectAndMonth: Map<string, ProjectState>;
   issues: ProjectStateIssue[];
 }
+
+export type FlightIssueType =
+  | "STOP_EVENT"
+  | "ACTIVITY_GAP"
+  | "POST_STOP_CONTINUATION"
+  | "SERVICE_CHANGE_IN_FLIGHT"
+  | "MULTIPLE_PROJECT_STATES";
+
+export interface FlightIssue {
+  type: FlightIssueType;
+  clientId: string;
+  projectIds: string[];
+  month: Month;
+  message: string;
+}
+
+export interface ServicePeriod {
+  clientId: string;
+  startMonth: Month;
+  endMonth: Month;
+  projectIds: string[];
+  activeMonths: Month[];
+  stopMonth: Month | null;
+  issues: FlightIssue[];
+}
+
+export interface Flight {
+  clientId: string;
+  projectIds: string[];
+  projectId: string;
+  projectName: string;
+  serviceType: string;
+  projectType: string;
+  termMonths: number;
+  flightNo: number;
+  flightStart: Month;
+  plannedFlightEnd: Month;
+  flightEnd: Month;
+  lastActiveMonth: Month | null;
+  stopMonth: Month | null;
+  sourcePeriodStart: Month;
+  sourcePeriodEnd: Month;
+  issues: FlightIssue[];
+}
+
+export interface FlightBuildResult {
+  periods: ServicePeriod[];
+  flights: Flight[];
+  issues: FlightIssue[];
+}

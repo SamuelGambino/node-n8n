@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 
 import { CsvParseError } from "./csv.js";
+import { buildFlights, describeFlightBuild, FlightBuildError } from "./flights.js";
 import {
   buildClientHistories,
   buildInputIndexes,
@@ -30,6 +31,7 @@ async function main(): Promise<void> {
   const indexes = buildInputIndexes(data);
   const clientHistories = buildClientHistories(indexes);
   const projectStates = buildProjectStates(data, indexes);
+  const flightBuild = buildFlights(data, indexes, clientHistories, projectStates);
 
   console.log(`Данные загружены из: ${dataDirectory}`);
   console.log("\nЗагруженные таблицы:");
@@ -50,6 +52,11 @@ async function main(): Promise<void> {
   console.log("\nВременные состояния проектов:");
   console.log(`- восстановлено состояний: ${projectStates.states.length}`);
   console.log(`- конфликтов справочных сроков: ${projectStates.issues.length}`);
+
+  console.log("\nПериоды обслуживания и флайты:");
+  for (const description of describeFlightBuild(flightBuild)) {
+    console.log(`- ${description}`);
+  }
 }
 
 main().catch((error: unknown) => {
@@ -57,7 +64,8 @@ main().catch((error: unknown) => {
     error instanceof CsvParseError ||
     error instanceof DataValidationError ||
     error instanceof DataInvariantError ||
-    error instanceof ProjectStateResolutionError
+    error instanceof ProjectStateResolutionError ||
+    error instanceof FlightBuildError
   ) {
     const location = "source" in error && "row" in error && error.row
       ? ` (${error.source}, строка ${error.row})`
