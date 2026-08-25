@@ -58,3 +58,21 @@ export interface InputData {
   serviceTerms: ServiceTermRecord[];
   report: ReportRecord[];
 }
+
+export interface ClientHistory {
+  clientId: string;
+  projectIds: string[];
+}
+
+export interface InputIndexes {
+  projectsById: Map<string, ProjectRecord>;
+  serviceTermsByType: Map<string, number>;
+  serviceChangesByProject: Map<string, ServiceChangeRecord[]>;
+  historyByProject: Map<string, ProjectHistoryRecord>;
+  worksByProject: Map<string, WorkRecord[]>;
+}
+
+export interface ClientHistoryResult {
+  histories: ClientHistory[];
+  historyByProjectId: Map<string, ClientHistory>;
+}
