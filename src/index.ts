@@ -9,6 +9,7 @@ import {
   describeIndexes,
 } from "./indexes.js";
 import { DataValidationError, describeInputData, loadInputData } from "./loaders.js";
+import { describeStatusResolution, resolveFlightStatuses, StatusResolutionError } from "./statuses.js";
 import { buildProjectStates, ProjectStateResolutionError } from "./temporal-state.js";
 
 function getDataDirectory(args: string[]): string {
@@ -32,6 +33,7 @@ async function main(): Promise<void> {
   const clientHistories = buildClientHistories(indexes);
   const projectStates = buildProjectStates(data, indexes);
   const flightBuild = buildFlights(data, indexes, clientHistories, projectStates);
+  const statusResolution = resolveFlightStatuses(data, clientHistories, flightBuild);
 
   console.log(`Данные загружены из: ${dataDirectory}`);
   console.log("\nЗагруженные таблицы:");
@@ -57,6 +59,11 @@ async function main(): Promise<void> {
   for (const description of describeFlightBuild(flightBuild)) {
     console.log(`- ${description}`);
   }
+
+  console.log("\nИтоговые статусы флайтов:");
+  for (const description of describeStatusResolution(statusResolution)) {
+    console.log(`- ${description}`);
+  }
 }
 
 main().catch((error: unknown) => {
@@ -65,7 +72,8 @@ main().catch((error: unknown) => {
     error instanceof DataValidationError ||
     error instanceof DataInvariantError ||
     error instanceof ProjectStateResolutionError ||
-    error instanceof FlightBuildError
+    error instanceof FlightBuildError ||
+    error instanceof StatusResolutionError
   ) {
     const location = "source" in error && "row" in error && error.row
       ? ` (${error.source}, строка ${error.row})`

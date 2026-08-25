@@ -151,3 +151,38 @@ export interface FlightBuildResult {
   flights: Flight[];
   issues: FlightIssue[];
 }
+
+export type FlightStatus =
+  | "завершился (разовые работы)"
+  | "отвал"
+  | "пролонгировано"
+  | "непролонгировано"
+  | "неизвестно"
+  | "NEEDS_REVIEW";
+
+export type StatusIssueType =
+  | "ACTIVITY_AFTER_REPORT_DATE"
+  | "DELAYED_RENEWAL"
+  | "IRREGULAR_ACTIVITY"
+  | "MISSING_REPORT_GENERATED_AT";
+
+export interface StatusIssue {
+  type: StatusIssueType;
+  clientId: string;
+  projectIds: string[];
+  flightNo: number;
+  month: Month | null;
+  message: string;
+}
+
+export interface ResolvedFlight extends Flight {
+  status: FlightStatus;
+  statusComment: string;
+  statusIssues: StatusIssue[];
+}
+
+export interface StatusResolutionResult {
+  reportGeneratedAt: Month;
+  flights: ResolvedFlight[];
+  issues: StatusIssue[];
+}
