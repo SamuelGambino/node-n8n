@@ -1,3 +1,5 @@
+// Временное состояние восстанавливает атрибуты именно на месяц отгрузки,
+// а не берёт текущие значения из projects.csv без учёта истории.
 import type {
   InputData,
   InputIndexes,
@@ -79,6 +81,10 @@ function resolveHistoricalServiceType(
   return serviceType;
 }
 
+/**
+ * service_terms.csv — расчётный источник срока; projects.term_months — контроль.
+ * Расхождение превращается в DATA_CONFLICT и никогда не исправляется молча.
+ */
 function resolveTermMonths(
   projectId: string,
   month: Month,
@@ -145,6 +151,7 @@ export function resolveProjectState(
   };
 }
 
+/** Создаёт ProjectState для каждой фактической пары project_id + month из works.csv. */
 export function buildProjectStates(data: InputData, indexes: InputIndexes): ProjectStateResult {
   const stateByProjectAndMonth = new Map<string, ProjectState>();
   const issues: ProjectStateIssue[] = [];

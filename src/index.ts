@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 
+import { buildAnalysisDocument, writeAnalysisDocument } from "./analysis.js";
 import { CsvParseError } from "./csv.js";
 import { buildFlights, describeFlightBuild, FlightBuildError } from "./flights.js";
 import {
@@ -9,6 +10,7 @@ import {
   describeIndexes,
 } from "./indexes.js";
 import { DataValidationError, describeInputData, loadInputData } from "./loaders.js";
+import { currentReportDate } from "./month.js";
 import {
   compareReport,
   describeReportComparison,
@@ -32,16 +34,34 @@ function getDataDirectory(args: string[]): string {
   return resolve(process.cwd(), value);
 }
 
+/**
+ * Оркестратор детерминированного аудита. Каждый этап получает только результат
+ * предыдущего, поэтому итоговые CSV и JSON можно воспроизвести из той же папки data.
+ */
 async function main(): Promise<void> {
   const dataDirectory = getDataDirectory(process.argv.slice(2));
+  const outputReportGeneratedAt = currentReportDate();
   const data = await loadInputData(dataDirectory);
   const indexes = buildInputIndexes(data);
   const clientHistories = buildClientHistories(indexes);
   const projectStates = buildProjectStates(data, indexes);
   const flightBuild = buildFlights(data, indexes, clientHistories, projectStates);
   const statusResolution = resolveFlightStatuses(data, clientHistories, flightBuild);
-  const comparison = compareReport(data, statusResolution, projectStates);
+  const comparison = compareReport(
+    data,
+    statusResolution,
+    projectStates,
+    outputReportGeneratedAt,
+  );
   const reportArtifacts = await writeReportArtifacts(comparison, process.cwd());
+  const analysisDocument = buildAnalysisDocument(
+    data,
+    projectStates,
+    statusResolution,
+    comparison,
+    outputReportGeneratedAt,
+  );
+  const analysisPath = await writeAnalysisDocument(analysisDocument, process.cwd());
 
   console.log(`Данные загружены из: ${dataDirectory}`);
   console.log("\nЗагруженные таблицы:");
@@ -79,6 +99,7 @@ async function main(): Promise<void> {
   }
   console.log(`- исправленный отчёт: ${reportArtifacts.reportFixedPath}`);
   console.log(`- детализированные расхождения: ${reportArtifacts.discrepanciesPath}`);
+  console.log(`- аналитика для ИИ: ${analysisPath}`);
 }
 
 main().catch((error: unknown) => {

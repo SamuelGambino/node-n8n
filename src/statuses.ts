@@ -1,3 +1,5 @@
+// Статусы считаются на историческую дату среза из исходного report.csv.
+// Эта дата отличается от текущей даты формирования нового report_fixed.csv.
 import { addMonths, isMonthInRange } from "./month.js";
 import type {
   ClientHistoryResult,
@@ -22,6 +24,7 @@ export class StatusResolutionError extends Error {
   }
 }
 
+/** Извлекает единую историческую дату, на которой был построен проверяемый отчёт. */
 function resolveReportGeneratedAt(data: InputData): Month {
   const reportDates = [...new Set(data.report.map((row) => row.reportGeneratedAt))];
   if (reportDates.length === 0) {
@@ -153,6 +156,10 @@ function createStatusIssue(
   };
 }
 
+/**
+ * Реализует decision tree из main_rules.txt: разовый проект → STOP → продление
+ * без разрыва → неоднозначные случаи → непродление/неизвестно.
+ */
 function resolveStatus(
   flight: Flight,
   allFlights: Flight[],
@@ -280,6 +287,7 @@ function resolveStatus(
   };
 }
 
+/** Рассчитывает статусы только по данным, доступным на историческую дату среза. */
 export function resolveFlightStatuses(
   data: InputData,
   histories: ClientHistoryResult,

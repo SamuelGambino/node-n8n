@@ -1,3 +1,5 @@
+// Модуль строит expected report, сравнивает его с report.csv и сохраняет
+// машинно-читаемые артефакты: report_fixed.csv и audit_discrepancies.json.
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -44,6 +46,7 @@ function displayValue(value: string | number | null): string {
   return value === null ? "" : String(value);
 }
 
+/** Ключ флайта стабилен даже при изменении атрибутов строки и нужен для честного сопоставления. */
 function comparisonKey(row: Pick<ExpectedReportRecord, "clientId" | "flightNo" | "flightStart">): string {
   return `${row.clientId}::${row.flightNo}::${row.flightStart}`;
 }
@@ -193,6 +196,7 @@ function statusAuditDiscrepancies(
 function appendExpectedAndSourceDiscrepancies(
   expectedRecords: ExpectedReportRecord[],
   sourceRecords: ReportRecord[],
+  historicalReportCutoff: ExpectedReportRecord["reportGeneratedAt"],
 ): ReportDiscrepancy[] {
   const discrepancies: ReportDiscrepancy[] = [];
   const sourceByKey = new Map<string, ReportRecord>();
@@ -246,7 +250,12 @@ function appendExpectedAndSourceDiscrepancies(
     }
 
     for (const field of REPORT_FIELDS) {
-      const expectedValue = expectedRecord[field.key];
+      // Дата в исходном отчёте — исторический срез для аудита, а в новом файле
+      // должна быть дата запуска. Поэтому сравниваем source с историческим срезом,
+      // но сохраняем в report_fixed.csv актуальную дату формирования.
+      const expectedValue = field.key === "reportGeneratedAt"
+        ? historicalReportCutoff
+        : expectedRecord[field.key];
       const actualValue = reportValue(sourceRecord, field.key);
       if (displayValue(expectedValue) !== displayValue(actualValue)) {
         discrepancies.push(
@@ -339,15 +348,25 @@ function commentForRecord(
     .join(" ");
 }
 
+/**
+ * Сравнивает ожидаемые строки с исходными и не скрывает ни ошибки отчёта,
+ * ни противоречия источников, ни случаи NEEDS_REVIEW.
+ */
 export function compareReport(
   data: { report: ReportRecord[] },
   statusResolution: StatusResolutionResult,
   projectStates: ProjectStateResult,
+  outputReportGeneratedAt: ExpectedReportRecord["reportGeneratedAt"],
 ): ReportComparisonResult {
+  // Новый файл получает дату его фактического формирования, а не дату старого отчёта.
   const expectedRecords = statusResolution.flights.map((flight) =>
-    expectedFromFlight(flight, statusResolution.reportGeneratedAt),
+    expectedFromFlight(flight, outputReportGeneratedAt),
   );
-  const discrepancies = appendExpectedAndSourceDiscrepancies(expectedRecords, data.report);
+  const discrepancies = appendExpectedAndSourceDiscrepancies(
+    expectedRecords,
+    data.report,
+    statusResolution.reportGeneratedAt,
+  );
   let sequence = nextIssueSequence(discrepancies);
 
   for (let index = 0; index < statusResolution.flights.length; index += 1) {
@@ -415,9 +434,11 @@ function serializeFixedReport(records: FixedReportRecord[]): string {
     record.auditComment,
   ].map(escapeCsvValue).join(";"));
 
+  // BOM сохраняет корректное отображение русских заголовков и комментариев в Excel.
   return `\uFEFF${[header.join(";"), ...rows].join("\n")}\n`;
 }
 
+/** Сериализует удобный для Excel CSV и подробный JSON с каждым расхождением. */
 export async function writeReportArtifacts(
   comparison: ReportComparisonResult,
   outputDirectory: string,

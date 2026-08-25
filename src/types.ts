@@ -226,3 +226,54 @@ export interface ReportComparisonResult {
   fixedRecords: FixedReportRecord[];
   discrepancies: ReportDiscrepancy[];
 }
+
+/**
+ * Контракт analysis.json. В нём намеренно хранятся не только выводы,
+ * но и исходные факты, чтобы ИИ выполнял только понятное пользователю объяснение.
+ */
+export interface AnalysisIssue {
+  id: string;
+  categories: AuditFlag[];
+  severity: "high" | "medium" | "low";
+  title: string;
+  target: {
+    clientId: string;
+    flightNo: number;
+    flightStart: Month;
+    comparisonKey: string;
+  };
+  oldReportRow: ReportRecord | null;
+  expectedReportRow: ExpectedReportRecord | null;
+  fieldDifferences: ReportDiscrepancy[];
+  arguments: {
+    ruleApplied: string[];
+    facts: string[];
+    conclusion: string;
+  };
+  evidence: Record<string, unknown>;
+}
+
+export interface AnalysisQuestion {
+  id: string;
+  priority: "high" | "medium";
+  question: string;
+  reason: string;
+  requiredAnswer: string;
+  decisionImpact: string;
+  automaticHandling: string;
+  context: Record<string, unknown>;
+}
+
+export interface AnalysisDocument {
+  metadata: {
+    schemaVersion: "1.0";
+    generatedAt: Month;
+    historicalReportCutoff: Month;
+    purpose: string;
+  };
+  sourceDataSummary: Record<string, unknown>;
+  methodology: string[];
+  Issues: AnalysisIssue[];
+  Questions: AnalysisQuestion[];
+  statistics: Record<string, unknown>;
+}

@@ -1,3 +1,5 @@
+// Этот модуль преобразует помесячные отгрузки в непрерывные периоды и флайты.
+// Он сознательно фиксирует неоднозначности как FlightIssue вместо неявных догадок.
 import { isMonthInRange, isNextMonth, addMonths } from "./month.js";
 import { projectStateKey } from "./temporal-state.js";
 import type {
@@ -83,6 +85,10 @@ function getClientMonthActivities(
   return result;
 }
 
+/**
+ * Завершает непрерывный период клиента и добавляет факты о STOP/продолжении после STOP.
+ * Эти факты передаются в статусный decision tree и затем в analysis.json.
+ */
 function finalizePeriod(
   clientId: string,
   activities: ClientMonthActivity[],
@@ -133,6 +139,7 @@ function finalizePeriod(
   };
 }
 
+/** Делит календарно непрерывную активность клиента на периоды без пропусков месяцев. */
 export function buildServicePeriods(
   data: InputData,
   histories: ClientHistoryResult,
@@ -293,6 +300,10 @@ function lastActiveMonth(
   return activeMonths.at(-1) ?? null;
 }
 
+/**
+ * Делит каждый период на флайты по сроку услуги, действовавшей в первый месяц флайта.
+ * STOP имеет приоритет и сокращает только текущий флайт.
+ */
 export function buildFlights(
   data: InputData,
   indexes: InputIndexes,

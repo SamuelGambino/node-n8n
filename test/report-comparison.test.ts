@@ -23,10 +23,23 @@ test("формирует исправленный отчёт и детализи
   const projectStates = buildProjectStates(data, indexes);
   const flightBuild = buildFlights(data, indexes, histories, projectStates);
   const statusResolution = resolveFlightStatuses(data, histories, flightBuild);
-  const comparison = compareReport(data, statusResolution, projectStates);
+  const comparison = compareReport(
+    data,
+    statusResolution,
+    projectStates,
+    "2026-08-25",
+  );
 
   assert.equal(comparison.expectedRecords.length, 17);
   assert.equal(comparison.fixedRecords.length, 17);
+  assert.ok(comparison.fixedRecords.every((record) => record.reportGeneratedAt === "2026-08-25"));
+  assert.ok(
+    !comparison.discrepancies.some(
+      (discrepancy) =>
+        discrepancy.field === "report_generated_at" &&
+        discrepancy.actualValue === "2025-09-01",
+    ),
+  );
   assert.ok(comparison.discrepancies.length > 20);
 
   const gammaFirstFlight = comparison.fixedRecords.find(
