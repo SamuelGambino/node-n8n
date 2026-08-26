@@ -56,6 +56,20 @@ async function multipartPayload(options: {
   return { boundary, payload: Buffer.concat(chunks) };
 }
 
+test("страница загрузки содержит browser-first форму с шестью CSV", async () => {
+  const server = await buildAuditApi();
+  try {
+    const response = await server.inject({ method: "GET", url: "/" });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.headers["content-type"] ?? "", /text\/html/);
+    assert.match(response.body, /action="\/v1\/dashboard"/);
+    assert.match(response.body, /name="checked_report"/);
+    assert.match(response.body, /name="flight_length"/);
+  } finally {
+    await server.close();
+  }
+});
+
 test("API отклоняет multipart-запрос без metadata", async () => {
   const server = await buildAuditApi();
   try {
@@ -106,6 +120,51 @@ test("API принимает шесть CSV с произвольными име
     assert.ok(body.files.audit_discrepancies_json.discrepancies.length > 0);
     assert.ok(body.analysis.Issues.length > 0);
     assert.ok(body.analysis.Questions.length > 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("browser-first endpoint возвращает HTML-дашборд из ответа n8n без хранения", async () => {
+  const server = await buildAuditApi({
+    n8nClient: async (auditPayload) => ({
+      final_report_csv: auditPayload.files.report_fixed_csv,
+      audit_md: "# AUDIT\n\nИтог сформирован вторым ИИ-вызовом.",
+    }),
+  });
+  try {
+    const { boundary, payload } = await multipartPayload();
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/dashboard",
+      headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload,
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.headers["content-type"] ?? "", /text\/html/);
+    assert.match(response.body, /Результат аудита отчёта/);
+    assert.match(response.body, /Итог сформирован вторым ИИ-вызовом/);
+    assert.match(response.body, /Аврора Клиник/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("browser-first endpoint показывает HTML-ошибку без настроенного n8n", async () => {
+  const server = await buildAuditApi();
+  try {
+    const { boundary, payload } = await multipartPayload();
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/dashboard",
+      headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload,
+    });
+
+    assert.equal(response.statusCode, 503);
+    assert.match(response.headers["content-type"] ?? "", /text\/html/);
+    assert.match(response.body, /N8N_WEBHOOK_URL/);
   } finally {
     await server.close();
   }

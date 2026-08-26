@@ -5,10 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import multipart from "@fastify/multipart";
 
 import { runAudit } from "./audit.js";
+import { parseDashboardInput, renderDashboard } from "./dashboard.js";
+import { renderUploadPage } from "./upload-page.js";
 
 const FILE_ROLE_TO_INTERNAL_NAME = {
   checked_report: "report.csv",
@@ -37,11 +39,27 @@ interface UploadMetadata {
   flight_length: string;
 }
 
-interface AuditApiOptions {
-  accessToken?: string;
+interface AuditPayload {
+  requestId: string;
+  status: "completed";
+  request: UploadMetadata;
+  summary: Record<string, unknown>;
+  analysis: Awaited<ReturnType<typeof runAudit>>["analysis"];
+  files: {
+    report_fixed_csv: string;
+    audit_discrepancies_json: unknown;
+  };
 }
 
-/** Ошибка запроса, которую API безопасно возвращает вызывающему n8n-сценарию. */
+interface AuditApiOptions {
+  accessToken?: string;
+  n8nWebhookUrl?: string;
+  n8nWebhookToken?: string;
+  n8nTimeoutMs?: number;
+  n8nClient?: (payload: AuditPayload) => Promise<unknown>;
+}
+
+/** Ошибка запроса, которую API безопасно возвращает вызывающему n8n-сценарию или браузеру. */
 class AuditApiError extends Error {
   public constructor(
     public readonly statusCode: number,
@@ -139,19 +157,136 @@ function summaryForApi(result: Awaited<ReturnType<typeof runAudit>>): Record<str
   };
 }
 
+async function readUploadedCsv(request: FastifyRequest): Promise<{ metadata: UploadMetadata; files: Map<string, Buffer> }> {
+  if (!request.isMultipart()) {
+    throw new AuditApiError(415, "MULTIPART_REQUIRED", "Отправьте один multipart/form-data запрос.");
+  }
+
+  let metadataRaw: string | undefined;
+  const uploadedFiles = new Map<string, Buffer>();
+  for await (const part of request.parts()) {
+    if (part.type === "file") {
+      if (uploadedFiles.has(part.fieldname)) {
+        throw new AuditApiError(400, "DUPLICATE_UPLOAD", `Поле файла «${part.fieldname}» передано более одного раза.`);
+      }
+      const content = await part.toBuffer();
+      if (content.length === 0) {
+        throw new AuditApiError(400, "EMPTY_FILE", `Загруженный файл «${part.fieldname}» пуст.`);
+      }
+      uploadedFiles.set(part.fieldname, content);
+    } else if (part.fieldname === "metadata") {
+      if (metadataRaw !== undefined) {
+        throw new AuditApiError(400, "DUPLICATE_METADATA", "Поле metadata передано более одного раза.");
+      }
+      metadataRaw = String(part.value);
+    }
+  }
+
+  const metadata = parseMetadata(metadataRaw);
+  const expectedFiles = roleFileMap(metadata);
+  const unexpectedFiles = [...uploadedFiles.keys()].filter((name) => !expectedFiles.has(name));
+  if (unexpectedFiles.length > 0) {
+    throw new AuditApiError(400, "UNEXPECTED_FILE", `Загружены файлы, которых нет в metadata: ${unexpectedFiles.join(", ")}.`);
+  }
+
+  const missingFiles = [...expectedFiles.keys()].filter((name) => !uploadedFiles.has(name));
+  if (missingFiles.length > 0) {
+    throw new AuditApiError(400, "MISSING_FILES", `Не получены файлы из metadata: ${missingFiles.join(", ")}.`);
+  }
+
+  return { metadata, files: uploadedFiles };
+}
+
 /**
- * Создаёт API для хостинга. Один POST /v1/audit принимает шесть бинарных CSV
- * с произвольными именами и metadata, которое связывает эти имена с ролями аудита.
+ * Выполняет детерминированный аудит в изолированной временной папке.
+ * Файлы не сохраняются после HTTP-ответа и не передаются в ИИ напрямую.
+ */
+async function executeAudit(metadata: UploadMetadata, uploadedFiles: Map<string, Buffer>): Promise<AuditPayload> {
+  const requestId = randomUUID();
+  const workingDirectory = await mkdtemp(join(tmpdir(), "node-n8n-audit-"));
+  const dataDirectory = join(workingDirectory, "data");
+  const outputDirectory = join(workingDirectory, "output");
+
+  try {
+    await mkdir(dataDirectory, { recursive: true });
+    await mkdir(outputDirectory, { recursive: true });
+    for (const [uploadedName, internalName] of roleFileMap(metadata)) {
+      await writeFile(join(dataDirectory, internalName), uploadedFiles.get(uploadedName)!);
+    }
+
+    const result = await runAudit(dataDirectory, outputDirectory);
+    const [reportFixedCsv, discrepanciesRaw] = await Promise.all([
+      readFile(result.artifacts.reportFixedPath, "utf8"),
+      readFile(result.artifacts.discrepanciesPath, "utf8"),
+    ]);
+
+    return {
+      requestId,
+      status: "completed",
+      request: metadata,
+      summary: summaryForApi(result),
+      analysis: result.analysis,
+      files: {
+        report_fixed_csv: reportFixedCsv,
+        audit_discrepancies_json: JSON.parse(discrepanciesRaw),
+      },
+    };
+  } finally {
+    await rm(workingDirectory, { recursive: true, force: true });
+  }
+}
+
+async function callN8n(payload: AuditPayload, options: AuditApiOptions): Promise<unknown> {
+  if (options.n8nClient) {
+    return options.n8nClient(payload);
+  }
+  if (!options.n8nWebhookUrl) {
+    throw new AuditApiError(503, "N8N_NOT_CONFIGURED", "Для дашборда настройте переменную N8N_WEBHOOK_URL.");
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (options.n8nWebhookToken) {
+    headers.authorization = `Bearer ${options.n8nWebhookToken}`;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(options.n8nWebhookUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(options.n8nTimeoutMs ?? 120_000),
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new AuditApiError(502, "N8N_UNAVAILABLE", `Не удалось дождаться ответа n8n: ${detail}`);
+  }
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new AuditApiError(502, "N8N_ERROR", `n8n вернул HTTP ${response.status}: ${text.slice(0, 500)}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new AuditApiError(502, "N8N_INVALID_RESPONSE", "n8n должен вернуть JSON с final_report_csv и audit_md.");
+  }
+}
+
+function renderErrorPage(error: AuditApiError | Error): string {
+  const message = error instanceof AuditApiError || error instanceof Error ? error.message : String(error);
+  return `<!doctype html><html lang="ru"><meta charset="utf-8"><title>Ошибка обработки</title><style>body{margin:0;padding:40px;background:#f4f7fb;color:#1d2632;font:16px system-ui}main{max-width:700px;margin:auto;padding:28px;background:#fff;border:1px solid #dce3eb;border-radius:12px}a{color:#1463d8}</style><main><h1>Не удалось сформировать дашборд</h1><p>${message.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</p><p><a href="/">Вернуться к загрузке файлов</a></p></main></html>`;
+}
+
+/**
+ * Создаёт API и browser-first интерфейс. POST /v1/dashboard удерживает только
+ * текущий запрос: после n8n-ответа HTML отправляется браузеру, без БД и файлового хранения.
  */
 export async function buildAuditApi(options: AuditApiOptions = {}): Promise<FastifyInstance> {
   const server = Fastify({ logger: true, bodyLimit: 6 * 5 * 1024 * 1024 });
 
   await server.register(multipart, {
-    limits: {
-      files: REQUIRED_INTERNAL_NAMES.length,
-      fileSize: 5 * 1024 * 1024,
-      fields: 10,
-    },
+    limits: { files: REQUIRED_INTERNAL_NAMES.length, fileSize: 5 * 1024 * 1024, fields: 10 },
   });
 
   server.addHook("onRequest", async (request, reply) => {
@@ -162,117 +297,52 @@ export async function buildAuditApi(options: AuditApiOptions = {}): Promise<Fast
     }
   });
 
+  server.get("/", async (_request, reply) => reply.type("text/html; charset=utf-8").send(renderUploadPage()));
   server.get("/health", async () => ({
     status: "ok",
     endpoint: "POST /v1/audit",
+    dashboardEndpoint: "POST /v1/dashboard",
     metadataField: "metadata",
     requiredRoles: REQUIRED_FILE_ROLES,
     accessTokenRequired: Boolean(options.accessToken),
+    n8nConfigured: Boolean(options.n8nWebhookUrl || options.n8nClient),
   }));
 
   server.post("/v1/audit", async (request, reply) => {
     requireAuthorization(request.headers.authorization, options.accessToken);
-    if (!request.isMultipart()) {
-      throw new AuditApiError(415, "MULTIPART_REQUIRED", "Отправьте один multipart/form-data запрос.");
-    }
+    const upload = await readUploadedCsv(request);
+    return reply.status(200).send(await executeAudit(upload.metadata, upload.files));
+  });
 
-    const requestId = randomUUID();
-    const workingDirectory = await mkdtemp(join(tmpdir(), "node-n8n-audit-"));
-    const dataDirectory = join(workingDirectory, "data");
-    const outputDirectory = join(workingDirectory, "output");
-    let metadataRaw: string | undefined;
-    const uploadedFiles = new Map<string, Buffer>();
-
-    try {
-      for await (const part of request.parts()) {
-        if (part.type === "file") {
-          if (uploadedFiles.has(part.fieldname)) {
-            throw new AuditApiError(400, "DUPLICATE_UPLOAD", `Поле файла «${part.fieldname}» передано более одного раза.`);
-          }
-          const content = await part.toBuffer();
-          if (content.length === 0) {
-            throw new AuditApiError(400, "EMPTY_FILE", `Загруженный файл «${part.fieldname}» пуст.`);
-          }
-          uploadedFiles.set(part.fieldname, content);
-        } else if (part.fieldname === "metadata") {
-          if (metadataRaw !== undefined) {
-            throw new AuditApiError(400, "DUPLICATE_METADATA", "Поле metadata передано более одного раза.");
-          }
-          metadataRaw = String(part.value);
-        }
-      }
-
-      const metadata = parseMetadata(metadataRaw);
-      const expectedFiles = roleFileMap(metadata);
-      const unexpectedFiles = [...uploadedFiles.keys()].filter((name) => !expectedFiles.has(name));
-      if (unexpectedFiles.length > 0) {
-        throw new AuditApiError(
-          400,
-          "UNEXPECTED_FILE",
-          `Загружены файлы, которых нет в metadata: ${unexpectedFiles.join(", ")}.`,
-        );
-      }
-
-      const missingFiles = [...expectedFiles.keys()].filter((name) => !uploadedFiles.has(name));
-      if (missingFiles.length > 0) {
-        throw new AuditApiError(
-          400,
-          "MISSING_FILES",
-          `Не получены файлы из metadata: ${missingFiles.join(", ")}.`,
-        );
-      }
-
-      await mkdir(dataDirectory, { recursive: true });
-      await mkdir(outputDirectory, { recursive: true });
-      for (const [uploadedName, internalName] of expectedFiles) {
-        await writeFile(join(dataDirectory, internalName), uploadedFiles.get(uploadedName)!);
-      }
-
-      const result = await runAudit(dataDirectory, outputDirectory);
-      const [reportFixedCsv, discrepanciesRaw] = await Promise.all([
-        readFile(result.artifacts.reportFixedPath, "utf8"),
-        readFile(result.artifacts.discrepanciesPath, "utf8"),
-      ]);
-
-      return reply.status(200).send({
-        requestId,
-        status: "completed",
-        request: metadata,
-        summary: summaryForApi(result),
-        analysis: result.analysis,
-        files: {
-          report_fixed_csv: reportFixedCsv,
-          audit_discrepancies_json: JSON.parse(discrepanciesRaw),
-        },
-      });
-    } finally {
-      // Загруженные клиентом CSV и временные артефакты удаляются после подготовки ответа.
-      await rm(workingDirectory, { recursive: true, force: true });
-    }
+  server.post("/v1/dashboard", async (request, reply) => {
+    requireAuthorization(request.headers.authorization, options.accessToken);
+    const upload = await readUploadedCsv(request);
+    const auditPayload = await executeAudit(upload.metadata, upload.files);
+    const n8nResult = await callN8n(auditPayload, options);
+    const withDeterministicAnalysis = isRecord(n8nResult) && n8nResult.analysis === undefined
+      ? { ...n8nResult, analysis: auditPayload.analysis }
+      : n8nResult;
+    return reply.type("text/html; charset=utf-8").send(renderDashboard(parseDashboardInput(withDeterministicAnalysis)));
   });
 
   server.setErrorHandler((error, request, reply) => {
-    if (error instanceof AuditApiError) {
-      return reply.status(error.statusCode).send({
-        status: "error",
-        code: error.code,
-        message: error.message,
-        metadataFormat: "[{ submittedAt, formMode, checked_report, raw_monthly_shipments, projects_directory, projects_change_history, service_changes, flight_length }]",
-      });
-    }
-    if (error instanceof Error && error.name === "RequestFileTooLargeError") {
-      return reply.status(413).send({
-        status: "error",
-        code: "FILE_TOO_LARGE",
-        message: "Размер каждого CSV не должен превышать 5 МБ.",
-      });
-    }
+    const apiError = error instanceof AuditApiError
+      ? error
+      : error instanceof Error && error.name === "RequestFileTooLargeError"
+        ? new AuditApiError(413, "FILE_TOO_LARGE", "Размер каждого CSV не должен превышать 5 МБ.")
+        : new AuditApiError(422, "AUDIT_FAILED", error instanceof Error ? error.message : "Не удалось выполнить аудит.");
 
-    request.log.error(error);
-    return reply.status(422).send({
+    if (request.url.startsWith("/v1/dashboard")) {
+      return reply.status(apiError.statusCode).type("text/html; charset=utf-8").send(renderErrorPage(apiError));
+    }
+    if (!(error instanceof AuditApiError)) {
+      request.log.error(error);
+    }
+    return reply.status(apiError.statusCode).send({
       status: "error",
-      code: "AUDIT_FAILED",
-      message: error instanceof Error ? error.message : "Не удалось выполнить аудит загруженных файлов.",
+      code: apiError.code,
+      message: apiError.message,
+      metadataFormat: "[{ submittedAt, formMode, checked_report, raw_monthly_shipments, projects_directory, projects_change_history, service_changes, flight_length }]",
     });
   });
 
@@ -286,7 +356,12 @@ async function startApi(): Promise<void> {
     throw new Error("PORT должен быть целым числом от 1 до 65535.");
   }
 
-  const server = await buildAuditApi({ accessToken: process.env.API_ACCESS_TOKEN });
+  const server = await buildAuditApi({
+    accessToken: process.env.API_ACCESS_TOKEN,
+    n8nWebhookUrl: process.env.N8N_WEBHOOK_URL,
+    n8nWebhookToken: process.env.N8N_WEBHOOK_TOKEN,
+    n8nTimeoutMs: process.env.N8N_TIMEOUT_MS ? Number(process.env.N8N_TIMEOUT_MS) : undefined,
+  });
   await server.listen({ port, host });
   server.log.info(`Audit API is listening on http://${host}:${port}`);
 }
