@@ -20,28 +20,126 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function asNonEmptyString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+function unwrapSingleN8nItem(value: unknown): unknown {
+  if (Array.isArray(value) && value.length === 1) {
+    return value[0];
+  }
+  return value;
+}
+
+function removeMarkdownFence(value: string): string {
+  const fenced = value.match(/^```(?:csv|text|plaintext)?\s*\n([\s\S]*?)\n```\s*$/i);
+  return fenced ? fenced[1]!.trim() : value.trim();
+}
+
+/**
+ * Некоторые ИИ-узлы возвращают не текст, а сериализованное сообщение вида
+ * { parts: [{ text, thoughtSignature }] }. Извлекаем только text и никогда
+ * не подаём JSON-обёртку в CSV-парсер.
+ */
+function unwrapAiText(value: unknown): string | undefined {
+  let current = unwrapSingleN8nItem(value);
+
+  for (let depth = 0; depth < 4; depth += 1) {
+    const text = asNonEmptyString(current);
+    if (text) {
+      if ((text.startsWith("{") && text.endsWith("}")) || (text.startsWith("[") && text.endsWith("]"))) {
+        try {
+          current = JSON.parse(text);
+          continue;
+        } catch {
+          return removeMarkdownFence(text);
+        }
+      }
+      return removeMarkdownFence(text);
+    }
+
+    if (Array.isArray(current)) {
+      const partTexts = current
+        .filter(isRecord)
+        .map((part) => asNonEmptyString(part.text))
+        .filter((part): part is string => part !== undefined);
+      if (partTexts.length > 0) {
+        return removeMarkdownFence(partTexts.join("\n"));
+      }
+      current = unwrapSingleN8nItem(current);
+      continue;
+    }
+
+    if (isRecord(current)) {
+      if (Array.isArray(current.parts)) {
+        const partTexts = current.parts
+          .filter(isRecord)
+          .map((part) => asNonEmptyString(part.text))
+          .filter((part): part is string => part !== undefined);
+        if (partTexts.length > 0) {
+          return removeMarkdownFence(partTexts.join("\n"));
+        }
+      }
+
+      const nested = current.text ?? current.content ?? current.output;
+      if (nested !== undefined) {
+        current = nested;
+        continue;
+      }
+    }
+
+    break;
+  }
+
+  return undefined;
+}
+
+function validateFinalReportCsv(value: string): string {
+  if (!value.startsWith("client_id;")) {
+    throw new Error(
+      "n8n вернул final_report_csv не как CSV: ожидается строка заголовков, начинающаяся с «client_id;». " +
+      "В финальном Code/Merge node передайте извлечённый текст ИИ, а не весь JSON-объект ответа модели.",
+    );
+  }
+
+  try {
+    const rows = parseSemicolonCsv(value, "final_report_csv");
+    if (rows.length === 0) {
+      throw new Error("CSV содержит только заголовок без строк.");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `n8n вернул неполный или некорректный final_report_csv: ${detail} ` +
+      "Проверьте, что ИИ выдал CSV целиком, увеличьте лимит выходных токенов и передайте в Respond to Webhook только текст CSV.",
+    );
+  }
+
+  return value;
 }
 
 /**
  * Принимает единственный JSON, который n8n возвращает после двух ИИ-вызовов.
- * Имена final_report_csv и audit_md намеренно просты: они не смешивают UI с логикой аудита.
+ * Поддерживает типичные обёртки n8n и ИИ, но в Dashboard передаёт только чистый CSV/Markdown.
  */
 export function parseDashboardInput(value: unknown): DashboardInput {
-  if (!isRecord(value)) {
+  const item = unwrapSingleN8nItem(value);
+  if (!isRecord(item)) {
     throw new Error("n8n должен вернуть JSON-объект с полями final_report_csv и audit_md.");
   }
 
-  const finalReportCsv = asNonEmptyString(value.final_report_csv);
-  const auditMarkdown = asNonEmptyString(value.audit_md);
+  const finalReportCsv = unwrapAiText(item.final_report_csv);
+  const auditMarkdown = unwrapAiText(item.audit_md);
   if (!finalReportCsv || !auditMarkdown) {
-    throw new Error("В ответе n8n отсутствуют непустые поля final_report_csv или audit_md.");
+    throw new Error(
+      "В ответе n8n отсутствуют читаемые final_report_csv или audit_md. " +
+      "Убедитесь, что финальный Code/Merge node возвращает текст, а не объект сообщения ИИ.",
+    );
   }
 
   return {
-    finalReportCsv,
+    finalReportCsv: validateFinalReportCsv(finalReportCsv),
     auditMarkdown,
-    analysis: value.analysis,
+    analysis: item.analysis,
   };
 }
 
