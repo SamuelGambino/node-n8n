@@ -2,7 +2,7 @@ import "dotenv/config";
 
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import Fastify, { type FastifyInstance } from "fastify";
@@ -10,17 +10,32 @@ import multipart from "@fastify/multipart";
 
 import { runAudit } from "./audit.js";
 
-const REQUIRED_CSV_FILES = [
-  "works.csv",
-  "projects.csv",
-  "projects_history.csv",
-  "service_changes.csv",
-  "service_terms.csv",
-  "report.csv",
-] as const;
+const FILE_ROLE_TO_INTERNAL_NAME = {
+  checked_report: "report.csv",
+  raw_monthly_shipments: "works.csv",
+  projects_directory: "projects.csv",
+  projects_change_history: "projects_history.csv",
+  service_changes: "service_changes.csv",
+  flight_length: "service_terms.csv",
+} as const;
 
-const REQUIRED_FILE_SET = new Set<string>(REQUIRED_CSV_FILES);
-type RequiredCsvFile = typeof REQUIRED_CSV_FILES[number];
+type FileRole = keyof typeof FILE_ROLE_TO_INTERNAL_NAME;
+type InternalCsvName = typeof FILE_ROLE_TO_INTERNAL_NAME[FileRole];
+
+const REQUIRED_FILE_ROLES = Object.keys(FILE_ROLE_TO_INTERNAL_NAME) as FileRole[];
+const REQUIRED_INTERNAL_NAMES = Object.values(FILE_ROLE_TO_INTERNAL_NAME) as InternalCsvName[];
+
+/** Метаданные одного n8n-элемента: роль CSV указывает на имя бинарного multipart-поля. */
+interface UploadMetadata {
+  submittedAt: string;
+  formMode: string;
+  checked_report: string;
+  raw_monthly_shipments: string;
+  projects_directory: string;
+  projects_change_history: string;
+  service_changes: string;
+  flight_length: string;
+}
 
 interface AuditApiOptions {
   accessToken?: string;
@@ -38,20 +53,62 @@ class AuditApiError extends Error {
   }
 }
 
-function requestedFileName(fieldName: string, originalName: string | undefined): RequiredCsvFile {
-  // n8n может отправить имя CSV как поле multipart или как исходное имя бинарного файла.
-  const candidates = [fieldName, originalName ? basename(originalName) : null].filter(
-    (value): value is string => Boolean(value),
-  );
-  const resolved = candidates.find((value) => REQUIRED_FILE_SET.has(value));
-  if (!resolved) {
+function parseMetadata(value: string | undefined): UploadMetadata {
+  if (!value) {
     throw new AuditApiError(
       400,
-      "UNEXPECTED_FILE",
-      `Ожидался один из файлов: ${REQUIRED_CSV_FILES.join(", ")}. Получен файл «${originalName ?? fieldName}».`,
+      "MISSING_METADATA",
+      "Добавьте текстовое multipart-поле metadata с массивом из одного объекта ролей файлов.",
     );
   }
-  return resolved as RequiredCsvFile;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new AuditApiError(400, "INVALID_METADATA", "Поле metadata должно содержать корректный JSON.");
+  }
+
+  if (!Array.isArray(parsed) || parsed.length !== 1 || !isRecord(parsed[0])) {
+    throw new AuditApiError(
+      400,
+      "INVALID_METADATA",
+      "Поле metadata должно быть массивом ровно с одним объектом, как в согласованном формате.",
+    );
+  }
+
+  const candidate = parsed[0];
+  for (const field of ["submittedAt", "formMode", ...REQUIRED_FILE_ROLES]) {
+    if (typeof candidate[field] !== "string" || candidate[field].trim() === "") {
+      throw new AuditApiError(
+        400,
+        "INVALID_METADATA",
+        `В metadata должно присутствовать непустое строковое поле «${field}».`,
+      );
+    }
+  }
+
+  return candidate as unknown as UploadMetadata;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function roleFileMap(metadata: UploadMetadata): Map<string, InternalCsvName> {
+  const mapping = new Map<string, InternalCsvName>();
+  for (const role of REQUIRED_FILE_ROLES) {
+    const uploadedFieldName = metadata[role].trim();
+    if (mapping.has(uploadedFieldName)) {
+      throw new AuditApiError(
+        400,
+        "DUPLICATE_FILE_REFERENCE",
+        `В metadata имя «${uploadedFieldName}» назначено нескольким ролям файлов.`,
+      );
+    }
+    mapping.set(uploadedFieldName, FILE_ROLE_TO_INTERNAL_NAME[role]);
+  }
+  return mapping;
 }
 
 function requireAuthorization(authorization: string | undefined, accessToken: string | undefined): void {
@@ -74,37 +131,24 @@ function summaryForApi(result: Awaited<ReturnType<typeof runAudit>>): Record<str
   return {
     historicalReportCutoff: result.statusResolution.reportGeneratedAt,
     outputReportGeneratedAt: result.analysis.metadata.generatedAt,
-    inputRecords: {
-      works: result.data.works.length,
-      projects: result.data.projects.length,
-      projectsHistory: result.data.projectsHistory.length,
-      serviceChanges: result.data.serviceChanges.length,
-      serviceTerms: result.data.serviceTerms.length,
-      report: result.data.report.length,
-    },
-    output: {
-      uniqueClients: result.analysis.statistics.uniqueReconstructedClients,
-      flights: result.statusResolution.flights.length,
-      statuses: statusDistribution,
-      issues: result.analysis.statistics.issueCount,
-      questions: result.analysis.statistics.questionCount,
-    },
+    uniqueClients: result.analysis.statistics.uniqueReconstructedClients,
+    flights: result.statusResolution.flights.length,
+    statuses: statusDistribution,
+    issues: result.analysis.statistics.issueCount,
+    questions: result.analysis.statistics.questionCount,
   };
 }
 
 /**
- * Создаёт HTTP API без запуска TCP-порта. Это упрощает тестирование через inject()
- * и не позволяет тестам оставлять открытые сетевые соединения.
+ * Создаёт API для хостинга. Один POST /v1/audit принимает шесть бинарных CSV
+ * с произвольными именами и metadata, которое связывает эти имена с ролями аудита.
  */
 export async function buildAuditApi(options: AuditApiOptions = {}): Promise<FastifyInstance> {
-  const server = Fastify({
-    logger: true,
-    bodyLimit: 6 * 5 * 1024 * 1024,
-  });
+  const server = Fastify({ logger: true, bodyLimit: 6 * 5 * 1024 * 1024 });
 
   await server.register(multipart, {
     limits: {
-      files: REQUIRED_CSV_FILES.length,
+      files: REQUIRED_INTERNAL_NAMES.length,
       fileSize: 5 * 1024 * 1024,
       fields: 10,
     },
@@ -120,55 +164,68 @@ export async function buildAuditApi(options: AuditApiOptions = {}): Promise<Fast
 
   server.get("/health", async () => ({
     status: "ok",
-    requiredFiles: REQUIRED_CSV_FILES,
+    endpoint: "POST /v1/audit",
+    metadataField: "metadata",
+    requiredRoles: REQUIRED_FILE_ROLES,
     accessTokenRequired: Boolean(options.accessToken),
   }));
 
   server.post("/v1/audit", async (request, reply) => {
     requireAuthorization(request.headers.authorization, options.accessToken);
-
     if (!request.isMultipart()) {
-      throw new AuditApiError(
-        415,
-        "MULTIPART_REQUIRED",
-        "Отправьте шесть CSV как multipart/form-data.",
-      );
+      throw new AuditApiError(415, "MULTIPART_REQUIRED", "Отправьте один multipart/form-data запрос.");
     }
 
     const requestId = randomUUID();
     const workingDirectory = await mkdtemp(join(tmpdir(), "node-n8n-audit-"));
     const dataDirectory = join(workingDirectory, "data");
     const outputDirectory = join(workingDirectory, "output");
-    const receivedFiles = new Set<RequiredCsvFile>();
+    let metadataRaw: string | undefined;
+    const uploadedFiles = new Map<string, Buffer>();
 
     try {
-      await mkdir(dataDirectory, { recursive: true });
-      await mkdir(outputDirectory, { recursive: true });
-
       for await (const part of request.parts()) {
-        if (part.type !== "file") {
-          continue;
+        if (part.type === "file") {
+          if (uploadedFiles.has(part.fieldname)) {
+            throw new AuditApiError(400, "DUPLICATE_UPLOAD", `Поле файла «${part.fieldname}» передано более одного раза.`);
+          }
+          const content = await part.toBuffer();
+          if (content.length === 0) {
+            throw new AuditApiError(400, "EMPTY_FILE", `Загруженный файл «${part.fieldname}» пуст.`);
+          }
+          uploadedFiles.set(part.fieldname, content);
+        } else if (part.fieldname === "metadata") {
+          if (metadataRaw !== undefined) {
+            throw new AuditApiError(400, "DUPLICATE_METADATA", "Поле metadata передано более одного раза.");
+          }
+          metadataRaw = String(part.value);
         }
-        const fileName = requestedFileName(part.fieldname, part.filename);
-        if (receivedFiles.has(fileName)) {
-          throw new AuditApiError(400, "DUPLICATE_FILE", `Файл «${fileName}» передан более одного раза.`);
-        }
-
-        const content = await part.toBuffer();
-        if (content.length === 0) {
-          throw new AuditApiError(400, "EMPTY_FILE", `Файл «${fileName}» пуст.`);
-        }
-        await writeFile(join(dataDirectory, fileName), content);
-        receivedFiles.add(fileName);
       }
 
-      const missingFiles = REQUIRED_CSV_FILES.filter((fileName) => !receivedFiles.has(fileName));
+      const metadata = parseMetadata(metadataRaw);
+      const expectedFiles = roleFileMap(metadata);
+      const unexpectedFiles = [...uploadedFiles.keys()].filter((name) => !expectedFiles.has(name));
+      if (unexpectedFiles.length > 0) {
+        throw new AuditApiError(
+          400,
+          "UNEXPECTED_FILE",
+          `Загружены файлы, которых нет в metadata: ${unexpectedFiles.join(", ")}.`,
+        );
+      }
+
+      const missingFiles = [...expectedFiles.keys()].filter((name) => !uploadedFiles.has(name));
       if (missingFiles.length > 0) {
         throw new AuditApiError(
           400,
           "MISSING_FILES",
-          `Не получены обязательные CSV: ${missingFiles.join(", ")}.`,
+          `Не получены файлы из metadata: ${missingFiles.join(", ")}.`,
         );
+      }
+
+      await mkdir(dataDirectory, { recursive: true });
+      await mkdir(outputDirectory, { recursive: true });
+      for (const [uploadedName, internalName] of expectedFiles) {
+        await writeFile(join(dataDirectory, internalName), uploadedFiles.get(uploadedName)!);
       }
 
       const result = await runAudit(dataDirectory, outputDirectory);
@@ -180,16 +237,16 @@ export async function buildAuditApi(options: AuditApiOptions = {}): Promise<Fast
       return reply.status(200).send({
         requestId,
         status: "completed",
-        receivedFiles: REQUIRED_CSV_FILES,
+        request: metadata,
         summary: summaryForApi(result),
-        results: {
-          reportFixedCsv,
-          analysis: result.analysis,
-          auditDiscrepancies: JSON.parse(discrepanciesRaw),
+        analysis: result.analysis,
+        files: {
+          report_fixed_csv: reportFixedCsv,
+          audit_discrepancies_json: JSON.parse(discrepanciesRaw),
         },
       });
     } finally {
-      // Загруженные клиентом файлы и сформированные результаты удаляются после ответа.
+      // Загруженные клиентом CSV и временные артефакты удаляются после подготовки ответа.
       await rm(workingDirectory, { recursive: true, force: true });
     }
   });
@@ -200,7 +257,7 @@ export async function buildAuditApi(options: AuditApiOptions = {}): Promise<Fast
         status: "error",
         code: error.code,
         message: error.message,
-        requiredFiles: REQUIRED_CSV_FILES,
+        metadataFormat: "[{ submittedAt, formMode, checked_report, raw_monthly_shipments, projects_directory, projects_change_history, service_changes, flight_length }]",
       });
     }
     if (error instanceof Error && error.name === "RequestFileTooLargeError") {
@@ -232,22 +289,6 @@ async function startApi(): Promise<void> {
   const server = await buildAuditApi({ accessToken: process.env.API_ACCESS_TOKEN });
   await server.listen({ port, host });
   server.log.info(`Audit API is listening on http://${host}:${port}`);
-
-  if (process.argv.includes("--tunnel")) {
-    if (!process.env.NGROK_AUTHTOKEN) {
-      throw new Error("Для --tunnel требуется переменная окружения NGROK_AUTHTOKEN.");
-    }
-    const ngrok = await import("@ngrok/ngrok");
-    const listener = await ngrok.forward({ addr: port, authtoken_from_env: true });
-    server.log.info(`Public ngrok URL: ${listener.url()}`);
-
-    const close = async (): Promise<void> => {
-      await listener.close();
-      await server.close();
-    };
-    process.once("SIGINT", () => void close());
-    process.once("SIGTERM", () => void close());
-  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

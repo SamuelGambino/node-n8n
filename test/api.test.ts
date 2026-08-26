@@ -6,27 +6,46 @@ import test from "node:test";
 import { buildAuditApi } from "../src/api.js";
 
 const dataDirectory = resolve(process.cwd(), "data");
-const requiredFiles = [
-  "works.csv",
-  "projects.csv",
-  "projects_history.csv",
-  "service_changes.csv",
-  "service_terms.csv",
-  "report.csv",
+const uploadedFiles = [
+  { fieldName: "monthly-data", sourceFile: "works.csv" },
+  { fieldName: "project-catalog", sourceFile: "projects.csv" },
+  { fieldName: "project-timeline", sourceFile: "projects_history.csv" },
+  { fieldName: "service-timeline", sourceFile: "service_changes.csv" },
+  { fieldName: "terms-catalog", sourceFile: "service_terms.csv" },
+  { fieldName: "previous-report", sourceFile: "report.csv" },
 ] as const;
 
-async function multipartPayload(fileNames: readonly string[]): Promise<{
-  boundary: string;
-  payload: Buffer;
-}> {
+const metadata = [{
+  submittedAt: "2026-08-26T11:30:37.227Z",
+  formMode: "instanceAi",
+  checked_report: "previous-report",
+  raw_monthly_shipments: "monthly-data",
+  projects_directory: "project-catalog",
+  projects_change_history: "project-timeline",
+  service_changes: "service-timeline",
+  flight_length: "terms-catalog",
+}];
+
+async function multipartPayload(options: {
+  includeMetadata?: boolean;
+  files?: readonly { fieldName: string; sourceFile: string }[];
+} = {}): Promise<{ boundary: string; payload: Buffer }> {
   const boundary = "----node-n8n-audit-test-boundary";
   const chunks: Buffer[] = [];
 
-  for (const fileName of fileNames) {
-    const content = await readFile(resolve(dataDirectory, fileName));
+  if (options.includeMetadata !== false) {
     chunks.push(Buffer.from(
       `--${boundary}\r\n` +
-      `Content-Disposition: form-data; name="${fileName}"; filename="${fileName}"\r\n` +
+      "Content-Disposition: form-data; name=\"metadata\"\r\n\r\n" +
+      `${JSON.stringify(metadata)}\r\n`,
+    ));
+  }
+
+  for (const { fieldName, sourceFile } of options.files ?? uploadedFiles) {
+    const content = await readFile(resolve(dataDirectory, sourceFile));
+    chunks.push(Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="${fieldName}"; filename="${sourceFile}"\r\n` +
       "Content-Type: text/csv\r\n\r\n",
     ));
     chunks.push(content);
@@ -37,10 +56,10 @@ async function multipartPayload(fileNames: readonly string[]): Promise<{
   return { boundary, payload: Buffer.concat(chunks) };
 }
 
-test("API отклоняет multipart-запрос без обязательных CSV", async () => {
+test("API отклоняет multipart-запрос без metadata", async () => {
   const server = await buildAuditApi();
   try {
-    const { boundary, payload } = await multipartPayload(["works.csv"]);
+    const { boundary, payload } = await multipartPayload({ includeMetadata: false });
     const response = await server.inject({
       method: "POST",
       url: "/v1/audit",
@@ -49,18 +68,16 @@ test("API отклоняет multipart-запрос без обязательн�
     });
 
     assert.equal(response.statusCode, 400);
-    const body = response.json() as { code: string; message: string };
-    assert.equal(body.code, "MISSING_FILES");
-    assert.match(body.message, /projects\.csv/);
+    assert.equal((response.json() as { code: string }).code, "MISSING_METADATA");
   } finally {
     await server.close();
   }
 });
 
-test("API принимает шесть CSV и возвращает report_fixed.csv вместе с analysis.json", async () => {
+test("API принимает шесть CSV с произвольными именами и возвращает analysis и files.report_fixed_csv", async () => {
   const server = await buildAuditApi({ accessToken: "integration-test-token" });
   try {
-    const { boundary, payload } = await multipartPayload(requiredFiles);
+    const { boundary, payload } = await multipartPayload();
     const response = await server.inject({
       method: "POST",
       url: "/v1/audit",
@@ -74,22 +91,21 @@ test("API принимает шесть CSV и возвращает report_fixed
     assert.equal(response.statusCode, 200);
     const body = response.json() as {
       status: string;
-      receivedFiles: string[];
-      summary: { output: { uniqueClients: number; issues: number; questions: number } };
-      results: {
-        reportFixedCsv: string;
-        analysis: { Issues: unknown[]; Questions: unknown[] };
-      };
+      request: typeof metadata[number];
+      summary: { uniqueClients: number; issues: number; questions: number };
+      analysis: { Issues: unknown[]; Questions: unknown[] };
+      files: { report_fixed_csv: string; audit_discrepancies_json: { discrepancies: unknown[] } };
     };
 
     assert.equal(body.status, "completed");
-    assert.deepEqual(body.receivedFiles, requiredFiles);
-    assert.equal(body.summary.output.uniqueClients, 11);
-    assert.ok(body.summary.output.issues > 0);
-    assert.ok(body.summary.output.questions > 0);
-    assert.match(body.results.reportFixedCsv, /report_generated_at/);
-    assert.ok(body.results.analysis.Issues.length > 0);
-    assert.ok(body.results.analysis.Questions.length > 0);
+    assert.equal(body.request.checked_report, "previous-report");
+    assert.equal(body.summary.uniqueClients, 11);
+    assert.ok(body.summary.issues > 0);
+    assert.ok(body.summary.questions > 0);
+    assert.match(body.files.report_fixed_csv, /report_generated_at/);
+    assert.ok(body.files.audit_discrepancies_json.discrepancies.length > 0);
+    assert.ok(body.analysis.Issues.length > 0);
+    assert.ok(body.analysis.Questions.length > 0);
   } finally {
     await server.close();
   }
