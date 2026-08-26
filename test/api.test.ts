@@ -146,6 +146,10 @@ test("browser-first endpoint возвращает HTML-дашборд из от�
     assert.match(response.body, /Результат аудита отчёта/);
     assert.match(response.body, /Итог сформирован вторым ИИ-вызовом/);
     assert.match(response.body, /Аврора Клиник/);
+    assert.match(response.body, /id="download-report"/);
+    assert.match(response.body, /id="download-audit"/);
+    assert.match(response.body, /report_final\.csv/);
+    assert.match(response.body, /audit\.md/);
   } finally {
     await server.close();
   }

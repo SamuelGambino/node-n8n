@@ -116,6 +116,7 @@ export function renderDashboard(input: DashboardInput): string {
     .map((status) => `<option value="${escapeHtml(status)}">${escapeHtml(status)}</option>`)
     .join("");
   const reportJson = JSON.stringify(input.finalReportCsv).replace(/</g, "\\u003c");
+  const auditJson = JSON.stringify(input.auditMarkdown).replace(/</g, "\\u003c");
 
   return `<!doctype html>
 <html lang="ru">
@@ -146,10 +147,10 @@ export function renderDashboard(input: DashboardInput): string {
     <section><h2>Статусы нового отчёта</h2>${renderStatusBadges(rows)}</section>
     <section>
       <h2>Новый итоговый отчёт</h2>
-      <div class="toolbar"><input id="search" type="search" placeholder="Поиск по клиенту, проекту, комментарию"><select id="status"><option value="">Все статусы</option>${statusOptions}</select><button id="download" type="button">Скачать CSV</button></div>
+      <div class="toolbar"><input id="search" type="search" placeholder="Поиск по клиенту, проекту, комментарию"><select id="status"><option value="">Все статусы</option>${statusOptions}</select><button id="download-report" type="button">Скачать итоговый CSV</button></div>
       ${renderTable(rows)}
     </section>
-    <section><h2>Аудит</h2>${renderAuditMarkdown(input.auditMarkdown)}</section>
+    <section><div class="toolbar"><h2 style="margin:0 auto 0 0">Аудит</h2><button id="download-audit" type="button">Скачать audit.md</button></div>${renderAuditMarkdown(input.auditMarkdown)}</section>
     <section><h2>Факты аудита</h2>${renderAnalysisList(input.analysis, "Issues", "Факты аудита не были возвращены n8n.")}</section>
     <section><h2>Вопросы к заказчику</h2>${renderAnalysisList(input.analysis, "Questions", "Вопросы к заказчику отсутствуют.")}</section>
   </main>
@@ -157,7 +158,9 @@ export function renderDashboard(input: DashboardInput): string {
     const search = document.getElementById('search'); const status = document.getElementById('status'); const rows = [...document.querySelectorAll('#report-table tbody tr')];
     function filterRows() { const query = search.value.toLowerCase(); const selected = status.value; rows.forEach((row) => { row.hidden = (query && !row.dataset.search.includes(query)) || (selected && row.dataset.status !== selected); }); }
     search?.addEventListener('input', filterRows); status?.addEventListener('change', filterRows);
-    document.getElementById('download')?.addEventListener('click', () => { const blob = new Blob([${reportJson}], { type: 'text/csv;charset=utf-8' }); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = 'report_final.csv'; link.click(); URL.revokeObjectURL(url); });
+    function downloadFile(content, filename, mimeType) { const blob = new Blob([content], { type: mimeType }); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = filename; document.body.append(link); link.click(); link.remove(); URL.revokeObjectURL(url); }
+    document.getElementById('download-report')?.addEventListener('click', () => downloadFile(${reportJson}, 'report_final.csv', 'text/csv;charset=utf-8'));
+    document.getElementById('download-audit')?.addEventListener('click', () => downloadFile(${auditJson}, 'audit.md', 'text/markdown;charset=utf-8'));
   </script>
 </body>
 </html>`;
