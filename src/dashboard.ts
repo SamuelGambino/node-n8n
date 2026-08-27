@@ -198,8 +198,8 @@ function renderAnalysisList(analysis: unknown, key: "Issues" | "Questions", empt
 }
 
 /**
- * Формирует самостоятельный HTML-документ. Он существует только в HTTP-ответе:
- * данные не записываются в БД, на диск или в объектное хранилище.
+ * Формирует самостоятельный HTML-документ из временно сохранённого результата.
+ * Исходные CSV не сохраняются, а готовые CSV/Markdown удаляются вместе с run по TTL.
  */
 export function renderDashboard(input: DashboardInput): string {
   let rows: CsvRow[];
@@ -234,7 +234,7 @@ export function renderDashboard(input: DashboardInput): string {
   </style>
 </head>
 <body>
-  <header><h1>Результат аудита отчёта</h1><p class="subtitle">Данные сформированы в текущем запросе и не сохранены на сервере.</p></header>
+  <header><h1>Результат аудита отчёта</h1><p class="subtitle">Результат временно доступен по этой защищённой ссылке до истечения срока хранения.</p></header>
   <main>
     <div class="grid">
       <div class="card"><div class="metric">Строк в новом отчёте</div><div class="number">${rows.length}</div></div>

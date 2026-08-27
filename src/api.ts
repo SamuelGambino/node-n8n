@@ -10,7 +10,8 @@ import multipart from "@fastify/multipart";
 
 import { runAudit } from "./audit.js";
 import { parseDashboardInput, renderDashboard } from "./dashboard.js";
-import { renderUploadPage } from "./upload-page.js";
+import { FileRunStore, type StoredRun } from "./run-store.js";
+import { renderUploadPage, renderWaitingPage } from "./upload-page.js";
 
 const FILE_ROLE_TO_INTERNAL_NAME = {
   checked_report: "report.csv",
@@ -27,7 +28,7 @@ type InternalCsvName = typeof FILE_ROLE_TO_INTERNAL_NAME[FileRole];
 const REQUIRED_FILE_ROLES = Object.keys(FILE_ROLE_TO_INTERNAL_NAME) as FileRole[];
 const REQUIRED_INTERNAL_NAMES = Object.values(FILE_ROLE_TO_INTERNAL_NAME) as InternalCsvName[];
 
-/** Метаданные одного n8n-элемента: роль CSV указывает на имя бинарного multipart-поля. */
+/** Метаданные одного запуска: каждая роль указывает на имя бинарного multipart-поля. */
 interface UploadMetadata {
   submittedAt: string;
   formMode: string;
@@ -51,15 +52,28 @@ interface AuditPayload {
   };
 }
 
+interface N8nStartPayload {
+  run_id: string;
+  callback_url: string;
+  audit: AuditPayload;
+}
+
 interface AuditApiOptions {
   accessToken?: string;
   n8nWebhookUrl?: string;
   n8nWebhookToken?: string;
-  n8nTimeoutMs?: number;
-  n8nClient?: (payload: AuditPayload) => Promise<unknown>;
+  n8nCallbackToken?: string;
+  /** Публичный базовый URL Render без завершающего слеша. */
+  publicBaseUrl?: string;
+  runStore?: FileRunStore;
+  runStoreDirectory?: string;
+  runTtlMs?: number;
+  n8nStartTimeoutMs?: number;
+  /** Используется в тестах и позволяет не вызывать реальный n8n webhook. */
+  n8nLauncher?: (payload: N8nStartPayload) => Promise<void>;
 }
 
-/** Ошибка запроса, которую API безопасно возвращает вызывающему n8n-сценарию или браузеру. */
+/** Контролируемая ошибка, безопасная для возврата браузеру и n8n. */
 class AuditApiError extends Error {
   public constructor(
     public readonly statusCode: number,
@@ -73,11 +87,7 @@ class AuditApiError extends Error {
 
 function parseMetadata(value: string | undefined): UploadMetadata {
   if (!value) {
-    throw new AuditApiError(
-      400,
-      "MISSING_METADATA",
-      "Добавьте текстовое multipart-поле metadata с массивом из одного объекта ролей файлов.",
-    );
+    throw new AuditApiError(400, "MISSING_METADATA", "Добавьте текстовое multipart-поле metadata с массивом из одного объекта ролей файлов.");
   }
 
   let parsed: unknown;
@@ -88,21 +98,13 @@ function parseMetadata(value: string | undefined): UploadMetadata {
   }
 
   if (!Array.isArray(parsed) || parsed.length !== 1 || !isRecord(parsed[0])) {
-    throw new AuditApiError(
-      400,
-      "INVALID_METADATA",
-      "Поле metadata должно быть массивом ровно с одним объектом, как в согласованном формате.",
-    );
+    throw new AuditApiError(400, "INVALID_METADATA", "Поле metadata должно быть массивом ровно с одним объектом, как в согласованном формате.");
   }
 
   const candidate = parsed[0];
   for (const field of ["submittedAt", "formMode", ...REQUIRED_FILE_ROLES]) {
     if (typeof candidate[field] !== "string" || candidate[field].trim() === "") {
-      throw new AuditApiError(
-        400,
-        "INVALID_METADATA",
-        `В metadata должно присутствовать непустое строковое поле «${field}».`,
-      );
+      throw new AuditApiError(400, "INVALID_METADATA", `В metadata должно присутствовать непустое строковое поле «${field}».`);
     }
   }
 
@@ -118,11 +120,7 @@ function roleFileMap(metadata: UploadMetadata): Map<string, InternalCsvName> {
   for (const role of REQUIRED_FILE_ROLES) {
     const uploadedFieldName = metadata[role].trim();
     if (mapping.has(uploadedFieldName)) {
-      throw new AuditApiError(
-        400,
-        "DUPLICATE_FILE_REFERENCE",
-        `В metadata имя «${uploadedFieldName}» назначено нескольким ролям файлов.`,
-      );
+      throw new AuditApiError(400, "DUPLICATE_FILE_REFERENCE", `В metadata имя «${uploadedFieldName}» назначено нескольким ролям файлов.`);
     }
     mapping.set(uploadedFieldName, FILE_ROLE_TO_INTERNAL_NAME[role]);
   }
@@ -197,10 +195,7 @@ async function readUploadedCsv(request: FastifyRequest): Promise<{ metadata: Upl
   return { metadata, files: uploadedFiles };
 }
 
-/**
- * Выполняет детерминированный аудит в изолированной временной папке.
- * Файлы не сохраняются после HTTP-ответа и не передаются в ИИ напрямую.
- */
+/** Выполняет аудит во временной директории; исходные CSV удаляются до возврата из функции. */
 async function executeAudit(metadata: UploadMetadata, uploadedFiles: Map<string, Buffer>): Promise<AuditPayload> {
   const requestId = randomUUID();
   const workingDirectory = await mkdtemp(join(tmpdir(), "node-n8n-audit-"));
@@ -236,53 +231,105 @@ async function executeAudit(metadata: UploadMetadata, uploadedFiles: Map<string,
   }
 }
 
-async function callN8n(payload: AuditPayload, options: AuditApiOptions): Promise<unknown> {
-  if (options.n8nClient) {
-    return options.n8nClient(payload);
+function baseUrl(options: AuditApiOptions): string {
+  const value = options.publicBaseUrl?.trim().replace(/\/+$/, "");
+  if (!value) {
+    throw new AuditApiError(503, "PUBLIC_BASE_URL_NOT_CONFIGURED", "Для асинхронного dashboard задайте PUBLIC_BASE_URL, например https://your-app.onrender.com.");
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      throw new Error("unsupported protocol");
+    }
+  } catch {
+    throw new AuditApiError(503, "PUBLIC_BASE_URL_INVALID", "PUBLIC_BASE_URL должен быть абсолютным HTTP(S)-URL.");
+  }
+  return value;
+}
+
+function callbackUrl(runId: string, options: AuditApiOptions): string {
+  return `${baseUrl(options)}/v1/runs/${runId}/result`;
+}
+
+async function startN8n(run: StoredRun, options: AuditApiOptions): Promise<void> {
+  const payload: N8nStartPayload = {
+    run_id: run.id,
+    callback_url: callbackUrl(run.id, options),
+    audit: run.auditPayload as AuditPayload,
+  };
+  if (options.n8nLauncher) {
+    await options.n8nLauncher(payload);
+    return;
   }
   if (!options.n8nWebhookUrl) {
-    throw new AuditApiError(503, "N8N_NOT_CONFIGURED", "Для дашборда настройте переменную N8N_WEBHOOK_URL.");
+    throw new AuditApiError(503, "N8N_NOT_CONFIGURED", "Для запуска обработки настройте N8N_WEBHOOK_URL.");
   }
 
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (options.n8nWebhookToken) {
     headers.authorization = `Bearer ${options.n8nWebhookToken}`;
   }
-
   let response: Response;
   try {
     response = await fetch(options.n8nWebhookUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(options.n8nTimeoutMs ?? 120_000),
+      signal: AbortSignal.timeout(options.n8nStartTimeoutMs ?? 20_000),
     });
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new AuditApiError(502, "N8N_UNAVAILABLE", `Не удалось дождаться ответа n8n: ${detail}`);
+    throw new AuditApiError(502, "N8N_START_UNAVAILABLE", `Не удалось запустить n8n: ${error instanceof Error ? error.message : String(error)}`);
   }
-
-  const text = await response.text();
   if (!response.ok) {
-    throw new AuditApiError(502, "N8N_ERROR", `n8n вернул HTTP ${response.status}: ${text.slice(0, 500)}`);
+    const detail = (await response.text()).slice(0, 500);
+    throw new AuditApiError(502, "N8N_START_ERROR", `n8n не принял запуск: HTTP ${response.status}: ${detail}`);
   }
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new AuditApiError(502, "N8N_INVALID_RESPONSE", "n8n должен вернуть JSON с final_report_csv и audit_md.");
+}
+
+function readViewToken(request: FastifyRequest): string | undefined {
+  const url = new URL(request.raw.url ?? "/", "http://localhost");
+  return url.searchParams.get("token") ?? undefined;
+}
+
+function requireViewToken(run: StoredRun, request: FastifyRequest): void {
+  if (readViewToken(request) !== run.viewToken) {
+    throw new AuditApiError(404, "RUN_NOT_FOUND", "Запуск не найден или ссылка на результат недействительна.");
   }
+}
+
+function publicRun(run: StoredRun, options: AuditApiOptions): Record<string, unknown> {
+  const token = encodeURIComponent(run.viewToken);
+  return {
+    run_id: run.id,
+    status: run.status,
+    created_at: run.createdAt,
+    updated_at: run.updatedAt,
+    expires_at: run.expiresAt,
+    status_url: `${baseUrl(options)}/v1/runs/${run.id}/status?token=${token}`,
+    dashboard_url: `${baseUrl(options)}/runs/${run.id}?token=${token}`,
+  };
 }
 
 function renderErrorPage(error: AuditApiError | Error): string {
-  const message = error instanceof AuditApiError || error instanceof Error ? error.message : String(error);
-  return `<!doctype html><html lang="ru"><meta charset="utf-8"><title>Ошибка обработки</title><style>body{margin:0;padding:40px;background:#f4f7fb;color:#1d2632;font:16px system-ui}main{max-width:700px;margin:auto;padding:28px;background:#fff;border:1px solid #dce3eb;border-radius:12px}a{color:#1463d8}</style><main><h1>Не удалось сформировать дашборд</h1><p>${message.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</p><p><a href="/">Вернуться к загрузке файлов</a></p></main></html>`;
+  const message = error.message.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  return `<!doctype html><html lang="ru"><meta charset="utf-8"><title>Ошибка обработки</title><style>body{margin:0;padding:40px;background:#f4f7fb;color:#1d2632;font:16px system-ui}main{max-width:700px;margin:auto;padding:28px;background:#fff;border:1px solid #dce3eb;border-radius:12px}a{color:#1463d8}</style><main><h1>Не удалось сформировать дашборд</h1><p>${message}</p><p><a href="/">Вернуться к загрузке файлов</a></p></main></html>`;
+}
+
+function isBrowserRunRequest(request: FastifyRequest): boolean {
+  return request.url.startsWith("/runs/")
+    || (request.url === "/v1/runs" && request.headers.accept?.includes("text/html") === true);
 }
 
 /**
- * Создаёт API и browser-first интерфейс. POST /v1/dashboard удерживает только
- * текущий запрос: после n8n-ответа HTML отправляется браузеру, без БД и файлового хранения.
+ * API поддерживает два режима. POST /v1/audit сразу возвращает детерминированные
+ * данные, а POST /v1/runs запускает долгий n8n workflow асинхронно и возвращает
+ * браузеру страницу ожидания. Финальный callback хранится во временном JSON.
  */
 export async function buildAuditApi(options: AuditApiOptions = {}): Promise<FastifyInstance> {
+  const store = options.runStore ?? new FileRunStore({
+    directory: options.runStoreDirectory ?? join(process.cwd(), "temp-db"),
+    ttlMs: options.runTtlMs,
+  });
   const server = Fastify({ logger: true, bodyLimit: 6 * 5 * 1024 * 1024 });
 
   await server.register(multipart, {
@@ -301,11 +348,13 @@ export async function buildAuditApi(options: AuditApiOptions = {}): Promise<Fast
   server.get("/health", async () => ({
     status: "ok",
     endpoint: "POST /v1/audit",
-    dashboardEndpoint: "POST /v1/dashboard",
+    startEndpoint: "POST /v1/runs",
+    callbackEndpoint: "POST /v1/runs/:runId/result",
     metadataField: "metadata",
     requiredRoles: REQUIRED_FILE_ROLES,
     accessTokenRequired: Boolean(options.accessToken),
-    n8nConfigured: Boolean(options.n8nWebhookUrl || options.n8nClient),
+    n8nConfigured: Boolean(options.n8nWebhookUrl || options.n8nLauncher),
+    callbackSecured: Boolean(options.n8nCallbackToken),
   }));
 
   server.post("/v1/audit", async (request, reply) => {
@@ -314,15 +363,83 @@ export async function buildAuditApi(options: AuditApiOptions = {}): Promise<Fast
     return reply.status(200).send(await executeAudit(upload.metadata, upload.files));
   });
 
-  server.post("/v1/dashboard", async (request, reply) => {
-    requireAuthorization(request.headers.authorization, options.accessToken);
+  server.post("/v1/runs", async (request, reply) => {
+    if (!options.n8nCallbackToken) {
+      throw new AuditApiError(503, "CALLBACK_NOT_CONFIGURED", "Для асинхронного dashboard задайте N8N_CALLBACK_TOKEN.");
+    }
+    if (!options.n8nWebhookUrl && !options.n8nLauncher) {
+      throw new AuditApiError(503, "N8N_NOT_CONFIGURED", "Для запуска обработки настройте N8N_WEBHOOK_URL.");
+    }
+    baseUrl(options);
     const upload = await readUploadedCsv(request);
     const auditPayload = await executeAudit(upload.metadata, upload.files);
-    const n8nResult = await callN8n(auditPayload, options);
-    const withDeterministicAnalysis = isRecord(n8nResult) && n8nResult.analysis === undefined
-      ? { ...n8nResult, analysis: auditPayload.analysis }
-      : n8nResult;
+    const run = await store.create(auditPayload);
+    try {
+      await startN8n(run, options);
+    } catch (error) {
+      const apiError = error instanceof AuditApiError
+        ? error
+        : new AuditApiError(502, "N8N_START_FAILED", error instanceof Error ? error.message : "Не удалось запустить n8n.");
+      await store.fail(run.id, apiError.code, apiError.message);
+    }
+    return reply.status(303).header("Location", `/runs/${run.id}?token=${encodeURIComponent(run.viewToken)}`).send();
+  });
+
+  server.get("/runs/:runId", async (request, reply) => {
+    const runId = (request.params as { runId: string }).runId;
+    const run = await store.read(runId);
+    if (!run) {
+      throw new AuditApiError(404, "RUN_NOT_FOUND", "Запуск не найден или срок временного хранения истёк.");
+    }
+    requireViewToken(run, request);
+    if (run.status === "processing") {
+      return reply.type("text/html; charset=utf-8").send(renderWaitingPage(run.id, run.viewToken));
+    }
+    if (run.status === "failed") {
+      return reply.status(502).type("text/html; charset=utf-8").send(renderErrorPage(new AuditApiError(502, run.error?.code ?? "N8N_FAILED", run.error?.message ?? "Обработка в n8n завершилась ошибкой.")));
+    }
+
+    const withDeterministicAnalysis = isRecord(run.n8nResult) && run.n8nResult.analysis === undefined
+      ? { ...run.n8nResult, analysis: (run.auditPayload as AuditPayload).analysis }
+      : run.n8nResult;
     return reply.type("text/html; charset=utf-8").send(renderDashboard(parseDashboardInput(withDeterministicAnalysis)));
+  });
+
+  server.get("/v1/runs/:runId/status", async (request, reply) => {
+    const runId = (request.params as { runId: string }).runId;
+    const run = await store.read(runId);
+    if (!run) {
+      throw new AuditApiError(404, "RUN_NOT_FOUND", "Запуск не найден или срок временного хранения истёк.");
+    }
+    requireViewToken(run, request);
+    return reply.send({ ...publicRun(run, options), error: run.error });
+  });
+
+  server.post("/v1/runs/:runId/result", async (request, reply) => {
+    if (!options.n8nCallbackToken) {
+      throw new AuditApiError(503, "CALLBACK_NOT_CONFIGURED", "Для приёма результата n8n задайте N8N_CALLBACK_TOKEN.");
+    }
+    requireAuthorization(request.headers.authorization, options.n8nCallbackToken);
+    const runId = (request.params as { runId: string }).runId;
+    const run = await store.read(runId);
+    if (!run) {
+      throw new AuditApiError(404, "RUN_NOT_FOUND", "Запуск не найден или срок временного хранения истёк.");
+    }
+
+    try {
+      const normalized = parseDashboardInput(request.body);
+      const result = {
+        final_report_csv: normalized.finalReportCsv,
+        audit_md: normalized.auditMarkdown,
+        analysis: normalized.analysis,
+      };
+      await store.complete(runId, result);
+      return reply.status(200).send({ status: "completed", run_id: runId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "n8n вернул некорректный итоговый результат.";
+      await store.fail(runId, "N8N_RESULT_INVALID", message);
+      throw new AuditApiError(422, "N8N_RESULT_INVALID", message);
+    }
   });
 
   server.setErrorHandler((error, request, reply) => {
@@ -332,18 +449,13 @@ export async function buildAuditApi(options: AuditApiOptions = {}): Promise<Fast
         ? new AuditApiError(413, "FILE_TOO_LARGE", "Размер каждого CSV не должен превышать 5 МБ.")
         : new AuditApiError(422, "AUDIT_FAILED", error instanceof Error ? error.message : "Не удалось выполнить аудит.");
 
-    if (request.url.startsWith("/v1/dashboard")) {
+    if (isBrowserRunRequest(request)) {
       return reply.status(apiError.statusCode).type("text/html; charset=utf-8").send(renderErrorPage(apiError));
     }
     if (!(error instanceof AuditApiError)) {
       request.log.error(error);
     }
-    return reply.status(apiError.statusCode).send({
-      status: "error",
-      code: apiError.code,
-      message: apiError.message,
-      metadataFormat: "[{ submittedAt, formMode, checked_report, raw_monthly_shipments, projects_directory, projects_change_history, service_changes, flight_length }]",
-    });
+    return reply.status(apiError.statusCode).send({ status: "error", code: apiError.code, message: apiError.message });
   });
 
   return server;
@@ -360,7 +472,11 @@ async function startApi(): Promise<void> {
     accessToken: process.env.API_ACCESS_TOKEN,
     n8nWebhookUrl: process.env.N8N_WEBHOOK_URL,
     n8nWebhookToken: process.env.N8N_WEBHOOK_TOKEN,
-    n8nTimeoutMs: process.env.N8N_TIMEOUT_MS ? Number(process.env.N8N_TIMEOUT_MS) : undefined,
+    n8nCallbackToken: process.env.N8N_CALLBACK_TOKEN,
+    publicBaseUrl: process.env.PUBLIC_BASE_URL,
+    runStoreDirectory: process.env.RUN_STORE_DIR,
+    runTtlMs: process.env.RUN_TTL_MS ? Number(process.env.RUN_TTL_MS) : undefined,
+    n8nStartTimeoutMs: process.env.N8N_START_TIMEOUT_MS ? Number(process.env.N8N_START_TIMEOUT_MS) : undefined,
   });
   await server.listen({ port, host });
   server.log.info(`Audit API is listening on http://${host}:${port}`);
